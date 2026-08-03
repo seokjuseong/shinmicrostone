@@ -1,16 +1,48 @@
-import 'dart:math' as math;
-import 'dart:typed_data';
+// lib/main.dart
+//
+// Medication Intake Detection - Server Test Client
+// Works on BOTH:
+//   - flutter run -d chrome        (Web)
+//   - flutter run                  (Android emulator/device)
+// with the EXACT same code path, because it uses camera.takePicture()
+// (supported on web + android) instead of startImageStream (android-only)
+// and sends frames to a Flask server for inference instead of
+// ML Kit + onnxruntime on-device.
+//
+// pubspec.yaml dependencies needed:
+//   camera: ^0.10.5+9
+//   http: ^1.2.0
+//   permission_handler: ^11.3.0   (android only, safe to keep for both)
+//
+// SERVER URL:
+//   - Android emulator -> Flask on your PC:      http://10.0.2.2:5000
+//   - Chrome (web) on the SAME PC as Flask:       http://localhost:5000
+//   - Real device / Chrome on ANOTHER machine:    http://<PC-LAN-IP>:5000
+//   Change kServerBaseUrl below accordingly, or pass --dart-define=SERVER_URL=...
+
+import 'dart:async';
+import 'dart:convert';
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import 'package:camera/camera.dart';
-import 'package:google_mlkit_pose_detection/google_mlkit_pose_detection.dart';
-import 'package:onnxruntime/onnxruntime.dart';
-import 'package:permission_handler/permission_handler.dart';
+import 'web_camera_helper.dart';
+import 'package:http/http.dart' as http;
+
+// ── Change this to match your setup (see comment block above) ──
+const String kServerBaseUrl = String.fromEnvironment(
+  'SERVER_URL',
+  defaultValue: 'http://localhost:5000', // default: Android emulator target
+);
+
+const Duration kCaptureInterval = Duration(milliseconds: 400);
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  final cameras = await availableCameras();
-  runApp(MyApp(cameras: cameras));
+  final cameras = await safeAvailableCameras();
+
+  runApp(
+    MyApp(cameras: cameras),
+  );
 }
 
 class MyApp extends StatelessWidget {
@@ -20,207 +52,129 @@ class MyApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Medication Tracker',
+      title: 'Medication Tracker (Server Test)',
       theme: ThemeData.dark(),
-      home: MedicationScreen(cameras: cameras),
+      home: MedicationTestScreen(cameras: cameras),
     );
   }
 }
 
-class MedicationScreen extends StatefulWidget {
+class MedicationTestScreen extends StatefulWidget {
   final List<CameraDescription> cameras;
-  const MedicationScreen({super.key, required this.cameras});
+  const MedicationTestScreen({super.key, required this.cameras});
 
   @override
-  State<MedicationScreen> createState() => _MedicationScreenState();
+  State<MedicationTestScreen> createState() => _MedicationTestScreenState();
 }
 
-class _MedicationScreenState extends State<MedicationScreen> {
-  CameraController? _cameraController;
-  PoseDetector?     _poseDetector;
-  OrtSession?       _ortSession;
+class _MedicationTestScreenState extends State<MedicationTestScreen> {
+  CameraController? _controller;
+  Timer? _captureTimer;
 
-  bool   _isDetecting = false;
-  bool   _isIntake    = false;
+  final String _sessionId =
+      'test-${DateTime.now().millisecondsSinceEpoch}';
+
+  bool _busy = false;
+  bool _isIntake = false;
+  bool _poseDetected = false;
   double _probability = 0.0;
-  int    _eventCount  = 0;
-  int    _consecutive = 0;
-  bool   _prevIntake  = false;
-
-  double _prevRWX = 0, _prevRWY = 0, _prevRWZ = 0;
-  double _prevLWX = 0, _prevLWY = 0, _prevLWZ = 0;
-
-  static const int minConsecutive = 5;
+  int _eventCount = 0;
+  int _consecutive = 0;
+  String _status = 'Initializing...';
 
   @override
   void initState() {
     super.initState();
-    _initialize();
+    _initCamera();
   }
 
-  Future<void> _initialize() async {
-    await Permission.camera.request();
+  Future<void> _initCamera() async {
+    if (widget.cameras.isEmpty) {
+      setState(() => _status = 'No camera found');
+      return;
+    }
 
-    // ONNX
-    OrtEnv.instance.init();
-    final data  = await rootBundle.load('assets/medication_model.onnx');
-    final bytes = data.buffer.asUint8List();
-    _ortSession = OrtSession.fromBuffer(bytes, OrtSessionOptions());
+    // On web, lensDirection is often unknown, so fall back to the first camera.
+    final front = widget.cameras.first;
 
-    // MediaPipe Pose
-    _poseDetector = PoseDetector(
-      options: PoseDetectorOptions(
-        model: PoseDetectionModel.accurate,
-        mode:  PoseDetectionMode.stream,
-      ),
-    );
-
-    // Front camera
-    final front = widget.cameras.firstWhere(
-          (c) => c.lensDirection == CameraLensDirection.front,
-      orElse: () => widget.cameras.first,
-    );
-    _cameraController = CameraController(
+    _controller = CameraController(
       front,
       ResolutionPreset.medium,
       enableAudio: false,
-      imageFormatGroup: ImageFormatGroup.nv21,
     );
-    await _cameraController!.initialize();
-    _cameraController!.startImageStream(_onFrame);
-    setState(() {});
-  }
 
-  void _onFrame(CameraImage image) async {
-    if (_isDetecting) return;
-    _isDetecting = true;
     try {
-      final inputImage = _toInputImage(image);
-      if (inputImage == null) { _isDetecting = false; return; }
-
-      final poses = await _poseDetector!.processImage(inputImage);
-      if (poses.isEmpty)      { _isDetecting = false; return; }
-
-      final lm = poses.first.landmarks;
-
-      final nose      = lm[PoseLandmarkType.nose];
-      final rWrist    = lm[PoseLandmarkType.rightWrist];
-      final lWrist    = lm[PoseLandmarkType.leftWrist];
-      final rElbow    = lm[PoseLandmarkType.rightElbow];
-      final lElbow    = lm[PoseLandmarkType.leftElbow];
-      final rShoulder = lm[PoseLandmarkType.rightShoulder];
-      final lShoulder = lm[PoseLandmarkType.leftShoulder];
-
-      if ([nose,rWrist,lWrist,rElbow,lElbow,rShoulder,lShoulder].any((e)=>e==null)) {
-        _isDetecting = false; return;
-      }
-
-      final iw = image.width.toDouble();
-      final ih = image.height.toDouble();
-      double nx(double v) => v / iw;
-      double ny(double v) => v / ih;
-      double nz(double v) => v / iw;
-
-      final hx  = nx(nose!.x),       hy  = ny(nose.y),       hz  = nz(nose.z);
-      final rwx = nx(rWrist!.x),      rwy = ny(rWrist.y),     rwz = nz(rWrist.z);
-      final lwx = nx(lWrist!.x),      lwy = ny(lWrist.y),     lwz = nz(lWrist.z);
-      final rex = nx(rElbow!.x),      rey = ny(rElbow.y),     rez = nz(rElbow.z);
-      final lex = nx(lElbow!.x),      ley = ny(lElbow.y),     lez = nz(lElbow.z);
-      final rsx = nx(rShoulder!.x),   rsy = ny(rShoulder.y),  rsz = nz(rShoulder.z);
-      final lsx = nx(lShoulder!.x),   lsy = ny(lShoulder.y),  lsz = nz(lShoulder.z);
-
-      double d3d(double x1, double y1, double z1,
-          double x2, double y2, double z2) =>
-          math.sqrt((x1-x2)*(x1-x2)+(y1-y2)*(y1-y2)+(z1-z2)*(z1-z2));
-
-      double ang(double dz, double dx) =>
-          math.atan2(dz, dx) * 180 / math.pi;
-
-      final features = Float32List.fromList([
-        d3d(rwx,rwy,rwz, hx,hy,hz),
-        rwz - hz,
-        rwy / (hy + 1e-6),
-        ang(rez - rsz, rex - rsx),
-        rwx - _prevRWX,
-        rwy - _prevRWY,
-        rwz - _prevRWZ,
-        d3d(lwx,lwy,lwz, hx,hy,hz),
-        lwz - hz,
-        lwy / (hy + 1e-6),
-        ang(lez - lsz, lex - lsx),
-        lwx - _prevLWX,
-        lwy - _prevLWY,
-        lwz - _prevLWZ,
-      ]);
-
-      _prevRWX = rwx; _prevRWY = rwy; _prevRWZ = rwz;
-      _prevLWX = lwx; _prevLWY = lwy; _prevLWZ = lwz;
-
-      // ONNX inference
-      final tensor  = OrtValueTensor.createTensorWithDataList(features, [1, 14]);
-      final results = await _ortSession!.runAsync(
-        OrtRunOptions(), {'float_input': tensor},
-      );
-      tensor.release();
-
-      final label = (results?[0]?.value as List)[0] as int;
-      final probs = results?[1]?.value as List;
-      final prob  = ((probs[0] as Map)[1] as double?) ?? 0.0;
-      for (var r in results ?? []) { r?.release(); }
-
-      if (label == 1) { _consecutive++; } else { _consecutive = 0; }
-      final confirmed = _consecutive >= minConsecutive;
-
-      setState(() {
-        if (confirmed && !_prevIntake) _eventCount++;
-        _prevIntake  = confirmed;
-        _isIntake    = confirmed;
-        _probability = prob;
-      });
-
+      await _controller!.initialize();
+      setState(() => _status = 'Connected');
+      _captureTimer = Timer.periodic(kCaptureInterval, (_) => _captureAndSend());
     } catch (e) {
-      debugPrint('Error: $e');
+      setState(() => _status = 'Camera init failed: $e');
     }
-    _isDetecting = false;
   }
 
-  InputImage? _toInputImage(CameraImage image) {
-    final rotation = InputImageRotationValue.fromRawValue(
-      _cameraController!.description.sensorOrientation,
-    ) ?? InputImageRotation.rotation0deg;
+  Future<void> _captureAndSend() async {
+    if (_busy || _controller == null || !_controller!.value.isInitialized) return;
+    _busy = true;
 
-    if (image.format.group != ImageFormatGroup.nv21) return null;
+    try {
+      final XFile file = await _controller!.takePicture();
+      final bytes = await file.readAsBytes();
 
-    return InputImage.fromBytes(
-      bytes: image.planes[0].bytes,
-      metadata: InputImageMetadata(
-        size:        Size(image.width.toDouble(), image.height.toDouble()),
-        rotation:    rotation,
-        format:      InputImageFormat.nv21,
-        bytesPerRow: image.planes[0].bytesPerRow,
-      ),
-    );
+      final uri = Uri.parse('$kServerBaseUrl/predict');
+      final request = http.MultipartRequest('POST', uri)
+        ..fields['session_id'] = _sessionId
+        ..files.add(http.MultipartFile.fromBytes(
+          'frame',
+          bytes,
+          filename: 'frame.jpg',
+        ));
+
+      final streamed = await request.send().timeout(const Duration(seconds: 5));
+      final body = await streamed.stream.bytesToString();
+
+      if (streamed.statusCode == 200) {
+        final data = jsonDecode(body) as Map<String, dynamic>;
+        if (mounted) {
+          setState(() {
+            _isIntake = (data['label'] as int) == 1;
+            _probability = (data['probability'] as num).toDouble();
+            _consecutive = data['consecutive'] as int;
+            _eventCount = data['event_count'] as int;
+            _poseDetected = data['pose_detected'] as bool;
+            _status = 'Connected';
+          });
+        }
+      } else {
+        if (mounted) setState(() => _status = 'Server error ${streamed.statusCode}');
+      }
+    } catch (e) {
+      if (mounted) setState(() => _status = 'Request failed: $e');
+    } finally {
+      _busy = false;
+    }
   }
 
   @override
   void dispose() {
-    _cameraController?.dispose();
-    _poseDetector?.close();
-    _ortSession?.release();
-    OrtEnv.instance.release();
+    _captureTimer?.cancel();
+    _controller?.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    final ready = _cameraController?.value.isInitialized ?? false;
+    final ready = _controller?.value.isInitialized ?? false;
     return Scaffold(
       backgroundColor: Colors.black,
       body: Stack(
         children: [
-          if (ready) SizedBox.expand(child: CameraPreview(_cameraController!)),
+          if (ready)
+            SizedBox.expand(child: CameraPreview(_controller!))
+          else
+            Center(
+              child: Text(_status, style: const TextStyle(color: Colors.white)),
+            ),
 
-          // Red border on intake
           if (_isIntake)
             Container(
               decoration: BoxDecoration(
@@ -237,22 +191,36 @@ class _MedicationScreenState extends State<MedicationScreen> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      Text(
+                        _isIntake ? 'INTAKE DETECTED!' : 'Normal',
+                        style: TextStyle(
+                          fontSize: 24,
+                          fontWeight: FontWeight.bold,
+                          color: _isIntake ? Colors.redAccent : Colors.greenAccent,
+                        ),
+                      ),
+                      Text(
+                        kIsWeb ? 'WEB' : 'ANDROID',
+                        style: const TextStyle(color: Colors.white38, fontSize: 12),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 4),
                   Text(
-                    _isIntake ? 'INTAKE DETECTED!' : 'Normal',
-                    style: TextStyle(
-                      fontSize: 26,
-                      fontWeight: FontWeight.bold,
-                      color: _isIntake ? Colors.redAccent : Colors.greenAccent,
-                    ),
+                    '$_status  •  pose: ${_poseDetected ? "detected" : "none"}',
+                    style: const TextStyle(color: Colors.white54, fontSize: 12),
                   ),
                   const SizedBox(height: 10),
                   ClipRRect(
                     borderRadius: BorderRadius.circular(6),
                     child: LinearProgressIndicator(
-                      value:           _probability.clamp(0.0, 1.0),
-                      minHeight:       12,
+                      value: _probability.clamp(0.0, 1.0),
+                      minHeight: 12,
                       backgroundColor: Colors.grey[800],
-                      valueColor:      AlwaysStoppedAnimation(
+                      valueColor: AlwaysStoppedAnimation(
                         _probability > 0.5 ? Colors.redAccent : Colors.greenAccent,
                       ),
                     ),
@@ -276,9 +244,9 @@ class _MedicationScreenState extends State<MedicationScreen> {
               child: Row(
                 mainAxisAlignment: MainAxisAlignment.spaceAround,
                 children: [
-                  _InfoBox(label: 'Events',      value: '$_eventCount'),
+                  _InfoBox(label: 'Events', value: '$_eventCount'),
                   _InfoBox(label: 'Consecutive', value: '$_consecutive'),
-                  _InfoBox(label: 'Prob %',      value: '${(_probability*100).toStringAsFixed(0)}'),
+                  _InfoBox(label: 'Prob %', value: (_probability * 100).toStringAsFixed(0)),
                 ],
               ),
             ),
